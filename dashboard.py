@@ -24,7 +24,11 @@ from calculos import (
     montecarlo_iteraciones, tabla_activos, tabla_portafolio,
     information_ratio
 )
-from optimizacion import optimizar_todos, frontera_eficiente, portafolio_combinado_sharpe, portafolio_combinado_ir
+from optimizacion import (
+    optimizar_todos, frontera_eficiente,
+    portafolio_combinado_sharpe, portafolio_combinado_ir,
+    portafolio_consenso
+)
 
 st.set_page_config(
     page_title="Portfolio Analyzer",
@@ -32,6 +36,243 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS INTERNOS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ir_portafolio(pesos: dict, df_ir: pd.DataFrame) -> float:
+    """IR ponderado: suma(peso_activo * IR_promedio_activo)."""
+    ir_prom = df_ir.mean()
+    total, w_sum = 0.0, 0.0
+    for activo, peso in pesos.items():
+        if activo in ir_prom.index:
+            total  += peso * ir_prom[activo]
+            w_sum  += peso
+    return total / w_sum if w_sum > 0 else 0.0
+
+
+def _safe_str(text) -> str:
+    """Sanitiza texto a Latin-1 para fpdf2."""
+    replacements = {'—': '-', '–': '-', '’': "'", '“': '"', '”': '"',
+                    'é': 'e', 'á': 'a', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ñ': 'n',
+                    'É': 'E', 'Á': 'A', 'Ó': 'O', 'Ú': 'U', 'Ñ': 'N', '…': '...'}
+    t = str(text) if text is not None else ""
+    for ch, rep in replacements.items():
+        t = t.replace(ch, rep)
+    return t.encode('latin-1', errors='ignore').decode('latin-1')
+
+
+def generar_pdf_portafolio(
+    cols_activos, benchmark, rf,
+    df_opt, port_combinado, criterio_combinado,
+    port_cons_ret, port_cons_vol,
+    df_ir, df_sharpe, df_ea, df_vol_a
+) -> bytes:
+    """Genera investing memo PDF del analisis de portafolio con fpdf2."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        return b""
+
+    C_DARK  = (30, 58, 95)
+    C_ALT   = (240, 244, 250)
+
+    class _PDF(FPDF):
+        def header(self):
+            self.set_fill_color(*C_DARK)
+            self.rect(0, 0, 210, 20, 'F')
+            self.set_font('Helvetica', 'B', 10)
+            self.set_text_color(255, 255, 255)
+            self.set_xy(10, 5)
+            self.cell(0, 10, 'PORTFOLIO ANALYZER - INVESTING MEMO')
+            self.set_text_color(0, 0, 0)
+
+        def footer(self):
+            self.set_y(-15)
+            self.set_font('Helvetica', 'I', 7)
+            self.set_text_color(120, 120, 120)
+            self.cell(0, 8,
+                f'Pagina {self.page_no()} | Generado: {datetime.now().strftime("%Y-%m-%d %H:%M")} | '
+                'Solo fines educativos. No constituye asesoria de inversion.',
+                align='C')
+            self.set_text_color(0, 0, 0)
+
+        def cell(self, w=0, h=0, txt='', border=0, ln=False, align='', fill=False, link=''):
+            super().cell(w, h, _safe_str(txt), border=border, ln=ln, align=align, fill=fill, link=link)
+
+    def section(pdf, title):
+        pdf.ln(4)
+        pdf.set_fill_color(*C_DARK)
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 8, f'  {title}', fill=True, ln=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+    def kv(pdf, label, value, alt=False):
+        pdf.set_fill_color(*(C_ALT if alt else (255, 255, 255)))
+        pdf.set_font('Helvetica', 'B', 8)
+        pdf.cell(70, 6.5, f'  {label}', border='LTB', fill=True)
+        pdf.set_font('Helvetica', '', 8)
+        pdf.cell(110, 6.5, f'  {value}', border='RTB', fill=True, ln=True)
+
+    pdf = _PDF()
+    pdf.set_margins(15, 25, 15)
+    pdf.set_auto_page_break(auto=True, margin=20)
+
+    # ── Portada ────────────────────────────────────────────────────────────────
+    pdf.add_page()
+    pdf.set_fill_color(*C_DARK)
+    pdf.rect(0, 50, 210, 80, 'F')
+    pdf.set_font('Helvetica', 'B', 22)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_xy(15, 65)
+    pdf.cell(0, 14, 'INVESTING MEMO', ln=True)
+    pdf.set_font('Helvetica', 'B', 14)
+    pdf.set_x(15)
+    pdf.cell(0, 10, 'Analisis de Portafolio - Optimizacion Markowitz', ln=True)
+    pdf.set_font('Helvetica', '', 11)
+    pdf.set_x(15)
+    pdf.cell(0, 8, f'Generado el {datetime.now().strftime("%d/%m/%Y %H:%M")}', ln=True)
+    pdf.set_x(15)
+    pdf.cell(0, 8, f'Activos: {", ".join(cols_activos)}  |  Benchmark: {benchmark}  |  RF: {rf:.2%}', ln=True)
+    pdf.set_text_color(0, 0, 0)
+
+    # ── Resumen ────────────────────────────────────────────────────────────────
+    pdf.set_xy(15, 145)
+    section(pdf, '1. RESUMEN EJECUTIVO')
+    kv(pdf, 'Activos analizados', str(len(cols_activos)), alt=True)
+    kv(pdf, 'Benchmark',          benchmark)
+    kv(pdf, 'Tasa libre de riesgo', f'{rf:.2%}', alt=True)
+    kv(pdf, 'Metodo combinacion',  criterio_combinado)
+    kv(pdf, 'Portafolio combinado - Retorno',    f'{port_combinado["retorno"]:.2%}', alt=True)
+    kv(pdf, 'Portafolio combinado - Volatilidad',f'{port_combinado["volatilidad"]:.2%}')
+    kv(pdf, 'Portafolio combinado - Sharpe',     f'{port_combinado["sharpe"]:.3f}', alt=True)
+
+    # ── 9 Portafolios ─────────────────────────────────────────────────────────
+    pdf.add_page()
+    section(pdf, '2. LOS 9 PORTAFOLIOS OPTIMOS (3 Metodos x 3 Objetivos)')
+
+    if not df_opt.empty:
+        # Cabecera
+        pdf.set_fill_color(*C_DARK)
+        pdf.set_font('Helvetica', 'B', 7)
+        pdf.set_text_color(255, 255, 255)
+        hdrs  = ['Metodo', 'Objetivo', 'Retorno', 'Volatilidad', 'Sharpe', 'IR Pond.']
+        wdths = [28, 32, 22, 25, 20, 22]
+        for h, w in zip(hdrs, wdths):
+            pdf.cell(w, 7, h, border=1, fill=True, align='C')
+        pdf.ln()
+        pdf.set_text_color(0, 0, 0)
+
+        for i, (idx, row) in enumerate(df_opt.iterrows()):
+            pesos_row = {a: row[a] for a in cols_activos if a in row.index}
+            ir_val = _ir_portafolio(pesos_row, df_ir)
+            alt = (i % 2 == 0)
+            pdf.set_fill_color(*(C_ALT if alt else (255, 255, 255)))
+            pdf.set_font('Helvetica', '', 7)
+            pdf.cell(28, 6.5, str(idx[0]), border=1, fill=True)
+            pdf.cell(32, 6.5, str(idx[1]), border=1, fill=True)
+            pdf.cell(22, 6.5, f'{row["Retorno"]:.2%}',     border=1, fill=True, align='C')
+            pdf.cell(25, 6.5, f'{row["Volatilidad"]:.2%}', border=1, fill=True, align='C')
+            pdf.cell(20, 6.5, f'{row["Sharpe"]:.3f}',      border=1, fill=True, align='C')
+            pdf.cell(22, 6.5, f'{ir_val:.3f}',             border=1, fill=True, align='C')
+            pdf.ln()
+
+    # ── Portafolio Combinado ───────────────────────────────────────────────────
+    section(pdf, '3. PORTAFOLIO COMBINADO')
+    kv(pdf, 'Criterio ponderacion', criterio_combinado, alt=True)
+    kv(pdf, 'Retorno esperado',    f'{port_combinado["retorno"]:.2%}')
+    kv(pdf, 'Volatilidad',         f'{port_combinado["volatilidad"]:.2%}', alt=True)
+    kv(pdf, 'Sharpe Ratio',        f'{port_combinado["sharpe"]:.3f}')
+    kv(pdf, 'N portafolios usados',str(port_combinado['n_portafolios_usados']), alt=True)
+
+    pdf.ln(3)
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.cell(0, 6, '  Asignacion de activos:', ln=True)
+    for i, (activo, peso) in enumerate(sorted(port_combinado['pesos'].items(), key=lambda x: -x[1])):
+        kv(pdf, activo, f'{peso:.2%}', alt=(i % 2 == 0))
+
+    # ── Portafolios Consenso ───────────────────────────────────────────────────
+    pdf.add_page()
+    section(pdf, '4. PORTAFOLIOS CONSENSO PONDERADOS')
+
+    for label, pc in [
+        ('Consenso 60% Max Retorno',       port_cons_ret),
+        ('Consenso 60% Min Volatilidad',   port_cons_vol),
+    ]:
+        pdf.ln(2)
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.cell(0, 7, f'  {label}', ln=True)
+        kv(pdf, 'Objetivo principal',  f'{pc["objetivo_principal"]} ({pc["peso_principal"]:.0%})', alt=True)
+        kv(pdf, 'Retorno esperado',    f'{pc["retorno"]:.2%}')
+        kv(pdf, 'Volatilidad',         f'{pc["volatilidad"]:.2%}', alt=True)
+        kv(pdf, 'Sharpe Ratio',        f'{pc["sharpe"]:.3f}')
+        kv(pdf, 'IR Ponderado',        f'{_ir_portafolio(pc["pesos"], df_ir):.3f}', alt=True)
+        pdf.ln(2)
+        pdf.set_font('Helvetica', 'B', 7.5)
+        pdf.set_fill_color(*C_DARK)
+        pdf.set_text_color(255, 255, 255)
+        for h, w in zip(['Activo', 'Peso'], [40, 30]):
+            pdf.cell(w, 6.5, h, border=1, fill=True, align='C')
+        pdf.ln()
+        pdf.set_text_color(0, 0, 0)
+        for j, (activo, peso) in enumerate(sorted(pc['pesos'].items(), key=lambda x: -x[1])):
+            pdf.set_fill_color(*(C_ALT if j % 2 == 0 else (255, 255, 255)))
+            pdf.set_font('Helvetica', '', 7.5)
+            pdf.cell(40, 6, activo, border=1, fill=True)
+            pdf.cell(30, 6, f'{peso:.2%}', border=1, fill=True, align='C')
+            pdf.ln()
+        pdf.ln(4)
+
+    # ── Metricas por activo ───────────────────────────────────────────────────
+    section(pdf, '5. METRICAS POR ACTIVO (ultimo periodo disponible)')
+    pdf.set_fill_color(*C_DARK)
+    pdf.set_font('Helvetica', 'B', 7)
+    pdf.set_text_color(255, 255, 255)
+    for h, w in zip(['Activo', 'Retorno EA', 'Volatilidad', 'Sharpe', 'IR'], [35, 28, 28, 22, 22]):
+        pdf.cell(w, 7, h, border=1, fill=True, align='C')
+    pdf.ln()
+    pdf.set_text_color(0, 0, 0)
+
+    ret_last = df_ea.iloc[-1] if not df_ea.empty else pd.Series()
+    vol_last = df_vol_a.iloc[-1] if not df_vol_a.empty else pd.Series()
+    shr_last = df_sharpe.iloc[-1] if not df_sharpe.empty else pd.Series()
+    ir_last  = df_ir.iloc[-1] if not df_ir.empty else pd.Series()
+
+    for i, activo in enumerate(cols_activos):
+        alt = (i % 2 == 0)
+        pdf.set_fill_color(*(C_ALT if alt else (255, 255, 255)))
+        pdf.set_font('Helvetica', '', 7)
+        def gv(series, key):
+            return f'{series[key]:.2%}' if key in series.index and not pd.isna(series[key]) else 'N/A'
+        def gf(series, key, fmt='.3f'):
+            return f'{series[key]:{fmt}}' if key in series.index and not pd.isna(series[key]) else 'N/A'
+        pdf.cell(35, 6.5, activo,               border=1, fill=True)
+        pdf.cell(28, 6.5, gv(ret_last, activo), border=1, fill=True, align='C')
+        pdf.cell(28, 6.5, gv(vol_last, activo), border=1, fill=True, align='C')
+        pdf.cell(22, 6.5, gf(shr_last, activo), border=1, fill=True, align='C')
+        pdf.cell(22, 6.5, gf(ir_last,  activo), border=1, fill=True, align='C')
+        pdf.ln()
+
+    # ── Disclaimer ────────────────────────────────────────────────────────────
+    pdf.add_page()
+    section(pdf, 'DISCLAIMER Y METODOLOGIA')
+    pdf.set_font('Helvetica', '', 8)
+    pdf.set_text_color(80, 80, 80)
+    disclaimer = _safe_str(
+        "Este documento es de caracter educativo e informativo unicamente. "
+        "No constituye asesoria financiera ni recomendacion de inversion. "
+        "Los modelos de optimizacion (Markowitz, CAPM, Montecarlo) implican supuestos "
+        "sobre distribucion de retornos que pueden no verificarse en el futuro.\n\n"
+        "Metodologia: WACC via CAPM, optimizacion via scipy SLSQP, "
+        "Information Ratio = (Retorno portafolio - Retorno benchmark) / Tracking Error. "
+        "Portafolios consenso: ponderacion por objetivo segun fraccion definida por el usuario."
+    )
+    pdf.multi_cell(0, 5, disclaimer)
+
+    return bytes(pdf.output())
 
 st.title(APP_TITULO)
 st.caption(APP_SUBTITULO)
@@ -202,6 +443,8 @@ if ejecutar:
             port_combinado = portafolio_combinado_sharpe(df_opt, cols_activos)
         else:
             port_combinado = portafolio_combinado_ir(df_opt, df_ir, cols_activos)
+        port_cons_ret = portafolio_consenso(df_opt, cols_activos, 'Max Retorno',      0.60)
+        port_cons_vol = portafolio_consenso(df_opt, cols_activos, 'Min Volatilidad',  0.60)
 
     # -------------------------------------------------------------------------
     # SECCIÓN 1: RESUMEN
@@ -249,7 +492,100 @@ if ejecutar:
     st.dataframe(df_pesos_comb, use_container_width=True)
 
     # -------------------------------------------------------------------------
-    # SECCIÓN 4: ANÁLISIS DETALLADO
+    # SECCIÓN 4: ANÁLISIS UNIFICADO DE PORTAFOLIOS
+    # -------------------------------------------------------------------------
+    st.header("🏆 Análisis Unificado de Portafolios")
+    st.caption("Comparación de los 9 portafolios optimizados + 2 portafolios consenso ponderados.")
+
+    # Tabla comparativa: 9 + 2 portafolios
+    if not df_opt.empty:
+        filas_unif = []
+        for idx, row in df_opt.iterrows():
+            pesos_row = {a: row[a] for a in cols_activos if a in row.index}
+            filas_unif.append({
+                'Tipo':        'Optimizado',
+                'Metodo':      idx[0],
+                'Objetivo':    idx[1],
+                'Retorno':     row['Retorno'],
+                'Volatilidad': row['Volatilidad'],
+                'Sharpe':      row['Sharpe'],
+                'IR Pond.':    _ir_portafolio(pesos_row, df_ir),
+            })
+
+        for label, pc in [
+            ('Consenso 60% Max Retorno',     port_cons_ret),
+            ('Consenso 60% Min Volatilidad', port_cons_vol),
+        ]:
+            filas_unif.append({
+                'Tipo':        'Consenso',
+                'Metodo':      label,
+                'Objetivo':    f'{pc["objetivo_principal"]} ({pc["peso_principal"]:.0%})',
+                'Retorno':     pc['retorno'],
+                'Volatilidad': pc['volatilidad'],
+                'Sharpe':      pc['sharpe'],
+                'IR Pond.':    _ir_portafolio(pc['pesos'], df_ir),
+            })
+
+        df_unif = pd.DataFrame(filas_unif)
+        df_unif_display = df_unif.copy()
+        for col in ['Retorno', 'Volatilidad']:
+            df_unif_display[col] = df_unif_display[col].map(lambda x: f"{x:.2%}")
+        df_unif_display['Sharpe']    = df_unif_display['Sharpe'].map(lambda x: f"{x:.3f}")
+        df_unif_display['IR Pond.']  = df_unif_display['IR Pond.'].map(lambda x: f"{x:.3f}")
+        st.dataframe(df_unif_display, use_container_width=True, hide_index=True)
+
+        # Scatter retorno vs volatilidad — todos los portafolios
+        fig_unif = go.Figure()
+        colores_tipo = {'Optimizado': '#4C8BF5', 'Consenso': '#FFD600'}
+        simbolos     = {'Optimizado': 'circle',  'Consenso': 'star'}
+        for tipo in ['Optimizado', 'Consenso']:
+            sub = df_unif[df_unif['Tipo'] == tipo]
+            fig_unif.add_trace(go.Scatter(
+                x=sub['Volatilidad'],
+                y=sub['Retorno'],
+                mode='markers+text',
+                name=tipo,
+                text=sub['Objetivo'],
+                textposition='top center',
+                textfont=dict(size=8),
+                marker=dict(size=12 if tipo == 'Consenso' else 9,
+                            color=colores_tipo[tipo],
+                            symbol=simbolos[tipo],
+                            line=dict(color='white', width=1))
+            ))
+        fig_unif.update_layout(
+            title='Retorno vs Volatilidad — 9 Portafolios + 2 Consenso',
+            xaxis_title='Volatilidad Anual',
+            yaxis_title='Retorno Esperado',
+            xaxis=dict(tickformat='.1%'),
+            yaxis=dict(tickformat='.1%'),
+            height=420,
+            template='plotly_dark',
+        )
+        st.plotly_chart(fig_unif, use_container_width=True)
+
+    # Portafolios consenso — detalle
+    st.subheader("Portafolios Consenso Ponderados")
+    col_c1, col_c2 = st.columns(2)
+    for col_c, pc, label in [
+        (col_c1, port_cons_ret, "60% Max Retorno"),
+        (col_c2, port_cons_vol, "60% Min Volatilidad"),
+    ]:
+        with col_c:
+            st.markdown(f"**{label}**")
+            st.metric("Retorno",     f'{pc["retorno"]:.2%}')
+            st.metric("Volatilidad", f'{pc["volatilidad"]:.2%}')
+            st.metric("Sharpe",      f'{pc["sharpe"]:.3f}')
+            st.metric("IR Pond.",    f'{_ir_portafolio(pc["pesos"], df_ir):.3f}')
+            df_cons = pd.DataFrame(
+                sorted(pc['pesos'].items(), key=lambda x: -x[1]),
+                columns=['Activo', 'Peso']
+            )
+            df_cons['Peso'] = df_cons['Peso'].map(lambda x: f"{x:.1%}")
+            st.dataframe(df_cons, use_container_width=True, hide_index=True)
+
+    # -------------------------------------------------------------------------
+    # SECCIÓN 5: ANÁLISIS DETALLADO
     # -------------------------------------------------------------------------
     st.header("📊 Análisis Detallado")
 
@@ -375,41 +711,106 @@ if ejecutar:
     # SECCIÓN 6: EXPORTAR
     # -------------------------------------------------------------------------
     st.header("💾 Exportar")
+    col_exp1, col_exp2 = st.columns(2)
 
+    # ── Excel ─────────────────────────────────────────────────────────────────
     def generar_excel():
         buffer = BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df_precios.to_excel(writer, sheet_name='Precios')
-            df_rend.to_excel(writer, sheet_name='Rendimientos')
-            df_base100.to_excel(writer, sheet_name='Precios Base 100')
-            df_nom.to_excel(writer, sheet_name='Retorno Nominal')
-            df_ea.to_excel(writer, sheet_name='Retorno EA')
-            df_vol_d.to_excel(writer, sheet_name='Volatilidad Diaria')
-            df_vol_a.to_excel(writer, sheet_name='Volatilidad Anual')
-            df_sharpe.to_excel(writer, sheet_name='Sharpe Ratio')
-            df_ir.to_excel(writer, sheet_name='Information Ratio')
-            df_percentiles.to_excel(writer, sheet_name='Percentiles')
-            df_rango.to_frame().to_excel(writer, sheet_name='Rango Percentil')
-            df_corr.to_excel(writer, sheet_name='Correlacion')
-            df_cov_d.to_excel(writer, sheet_name='Covarianza Diaria')
-            df_cov_a.to_excel(writer, sheet_name='Covarianza Anual')
-            for metodo, df_t in tablas_act.items():
-                df_t.to_excel(writer, sheet_name=f'Tabla {metodo[:4].title()}')
-            if not df_opt.empty:
-                df_opt.to_excel(writer, sheet_name='Portafolios Optimos')
-            pd.DataFrame([port_combinado['pesos']]).T.to_excel(
-                writer, sheet_name='Portafolio Combinado'
-            )
+        try:
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                df_precios.to_excel(writer,    sheet_name='Precios')
+                df_rend.to_excel(writer,       sheet_name='Rendimientos')
+                df_base100.to_excel(writer,    sheet_name='Precios Base 100')
+                df_nom.to_excel(writer,        sheet_name='Retorno Nominal')
+                df_ea.to_excel(writer,         sheet_name='Retorno EA')
+                df_vol_d.to_excel(writer,      sheet_name='Volatilidad Diaria')
+                df_vol_a.to_excel(writer,      sheet_name='Volatilidad Anual')
+                df_sharpe.to_excel(writer,     sheet_name='Sharpe Ratio')
+                df_ir.to_excel(writer,         sheet_name='Information Ratio')
+                df_percentiles.to_excel(writer,sheet_name='Percentiles')
+                df_rango.to_frame().to_excel(writer, sheet_name='Rango Percentil')
+                df_corr.to_excel(writer,       sheet_name='Correlacion')
+                df_cov_d.to_excel(writer,      sheet_name='Covarianza Diaria')
+                df_cov_a.to_excel(writer,      sheet_name='Covarianza Anual')
+                for metodo, df_t in tablas_act.items():
+                    sname = f'Tabla {metodo[:5].title()}'[:31]
+                    df_t.to_excel(writer, sheet_name=sname)
+                if not df_opt.empty:
+                    df_opt.to_excel(writer, sheet_name='Portafolios Optimos')
+                # Portafolio combinado
+                df_pc = pd.DataFrame([port_combinado['pesos']]).T
+                df_pc.columns = ['Peso']
+                for col in ['retorno', 'volatilidad', 'sharpe']:
+                    df_pc.loc[col.capitalize(), 'Peso'] = port_combinado[col]
+                df_pc.to_excel(writer, sheet_name='Port Combinado')
+                # Portafolios consenso
+                for label_sheet, pc in [
+                    ('Consenso MaxRetorno', port_cons_ret),
+                    ('Consenso MinVol',     port_cons_vol),
+                ]:
+                    df_cs = pd.DataFrame(list(pc['pesos'].items()), columns=['Activo', 'Peso'])
+                    metr = pd.DataFrame([{'Activo': 'Retorno',    'Peso': pc['retorno']},
+                                         {'Activo': 'Volatilidad','Peso': pc['volatilidad']},
+                                         {'Activo': 'Sharpe',     'Peso': pc['sharpe']},
+                                         {'Activo': 'IR Pond.',   'Peso': _ir_portafolio(pc['pesos'], df_ir)}])
+                    pd.concat([df_cs, metr], ignore_index=True).to_excel(
+                        writer, sheet_name=label_sheet[:31], index=False)
+                # Analisis unificado
+                if not df_opt.empty:
+                    filas_xl = []
+                    for idx, row in df_opt.iterrows():
+                        pw = {a: row[a] for a in cols_activos if a in row.index}
+                        filas_xl.append({'Tipo':'Optimizado','Metodo':idx[0],'Objetivo':idx[1],
+                                         'Retorno':row['Retorno'],'Volatilidad':row['Volatilidad'],
+                                         'Sharpe':row['Sharpe'],'IR Pond.':_ir_portafolio(pw, df_ir)})
+                    for lbl, pc in [('Consenso 60% Max Retorno', port_cons_ret),
+                                    ('Consenso 60% Min Vol',     port_cons_vol)]:
+                        filas_xl.append({'Tipo':'Consenso','Metodo':lbl,'Objetivo':pc['objetivo_principal'],
+                                         'Retorno':pc['retorno'],'Volatilidad':pc['volatilidad'],
+                                         'Sharpe':pc['sharpe'],'IR Pond.':_ir_portafolio(pc['pesos'], df_ir)})
+                    pd.DataFrame(filas_xl).to_excel(writer, sheet_name='Analisis Unificado', index=False)
+        except Exception as e:
+            st.error(f"Error generando Excel: {e}")
         buffer.seek(0)
         return buffer
 
-    st.download_button(
-        label="📥 Descargar análisis completo en Excel",
-        data=generar_excel(),
-        file_name=EXCEL_EXPORT_NOMBRE,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
+    with col_exp1:
+        st.markdown("**📊 Excel — Modelo Completo**")
+        st.caption("19 hojas: precios, retornos, riesgo, correlacion, portafolios, consenso.")
+        st.download_button(
+            label="📥 Descargar Excel",
+            data=generar_excel(),
+            file_name=EXCEL_EXPORT_NOMBRE,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+    # ── PDF ───────────────────────────────────────────────────────────────────
+    with col_exp2:
+        st.markdown("**📄 PDF — Investing Memo**")
+        st.caption("Portafolios, consenso, metricas Sharpe e IR, asignacion de activos.")
+        if st.button("⚙️ Generar PDF", use_container_width=True, key="gen_pdf_pa"):
+            with st.spinner("Generando PDF..."):
+                try:
+                    pdf_bytes = generar_pdf_portafolio(
+                        cols_activos, benchmark, rf,
+                        df_opt, port_combinado, criterio_combinado,
+                        port_cons_ret, port_cons_vol,
+                        df_ir, df_sharpe, df_ea, df_vol_a
+                    )
+                    if pdf_bytes:
+                        st.download_button(
+                            label="📥 Descargar Investing Memo PDF",
+                            data=pdf_bytes,
+                            file_name=f"portfolio_memo_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key="dl_pdf_pa"
+                        )
+                    else:
+                        st.error("fpdf2 no esta instalado. Agrega fpdf2 a requirements.txt.")
+                except Exception as e:
+                    st.error(f"Error generando PDF: {e}")
 
 else:
     st.info("👈 Configura los parámetros en el panel izquierdo y presiona **Ejecutar análisis**.")

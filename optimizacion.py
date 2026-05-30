@@ -259,41 +259,8 @@ def frontera_eficiente(
             })
 
     return pd.DataFrame(puntos)
-def portafolio_combinado_sharpe(df_opt: pd.DataFrame, cols_activos: list) -> dict:
-    """
-    Combina los 9 portafolios óptimos en uno solo ponderado por Sharpe.
-    Excluye portafolios con Sharpe negativo.
-    """
-    df_positivos = df_opt[df_opt['Sharpe'] > 0].copy()
 
-    if df_positivos.empty:
-        df_positivos = df_opt.copy()
 
-    suma_sharpe = df_positivos['Sharpe'].sum()
-    pesos_port = df_positivos['Sharpe'] / suma_sharpe
-
-    pesos_combinados = {}
-    for activo in cols_activos:
-        if activo in df_positivos.columns:
-            pesos_combinados[activo] = (
-                df_positivos[activo] * pesos_port
-            ).sum()
-
-    suma_pesos = sum(pesos_combinados.values())
-    if suma_pesos > 0:
-        pesos_combinados = {k: v/suma_pesos for k, v in pesos_combinados.items()}
-
-    retorno_combinado = (df_positivos['Retorno'] * pesos_port).sum()
-    vol_combinada = (df_positivos['Volatilidad'] * pesos_port).sum()
-    sharpe_combinado = (df_positivos['Sharpe'] * pesos_port).sum()
-
-    return {
-        'pesos':                pesos_combinados,
-        'retorno':              retorno_combinado,
-        'volatilidad':          vol_combinada,
-        'sharpe':               sharpe_combinado,
-        'n_portafolios_usados': len(df_positivos)
-    }
 def portafolio_combinado_ir(df_opt: pd.DataFrame, df_ir: pd.DataFrame, cols_activos: list) -> dict:
     """
     Combina los 9 portafolios óptimos ponderado por Information Ratio promedio.
@@ -337,4 +304,73 @@ def portafolio_combinado_ir(df_opt: pd.DataFrame, df_ir: pd.DataFrame, cols_acti
         'volatilidad':          vol_combinada,
         'sharpe':               sharpe_combinado,
         'n_portafolios_usados': len(df_positivos)
+    }
+
+
+def portafolio_consenso(
+    df_opt: pd.DataFrame,
+    cols_activos: list,
+    objetivo_principal: str,
+    peso_principal: float = 0.60
+) -> dict:
+    """
+    Crea un portafolio consenso asignando peso_principal al objetivo_principal
+    y distribuyendo el resto equitativamente entre los otros objetivos.
+
+    Ejemplo: objetivo_principal='Max Retorno', peso_principal=0.60
+      - Cada portafolio 'Max Retorno' recibe 60% / 3 = 20%
+      - Cada uno de los otros 6 recibe 40% / 6 = 6.67%
+
+    Parametros:
+        df_opt            : DataFrame de optimizar_todos() (MultiIndex Metodo/Objetivo)
+        cols_activos      : lista de tickers activos
+        objetivo_principal: 'Max Retorno' | 'Max Sharpe' | 'Min Volatilidad'
+        peso_principal    : fraccion asignada al objetivo principal (0-1)
+
+    Retorna:
+        dict con pesos, retorno, volatilidad, sharpe, objetivo_principal, peso_principal
+    """
+    if df_opt.empty:
+        return {'pesos': {}, 'retorno': 0.0, 'volatilidad': 0.0, 'sharpe': 0.0,
+                'objetivo_principal': objetivo_principal, 'peso_principal': peso_principal,
+                'n_portafolios_usados': 0}
+
+    peso_otros = 1.0 - peso_principal
+    objetivos_col = df_opt.index.get_level_values('Objetivo')
+
+    n_ppal  = (objetivos_col == objetivo_principal).sum()
+    n_otros = len(df_opt) - n_ppal
+    if n_ppal == 0:
+        n_ppal = 1
+
+    # Peso de cada fila
+    pesos_filas = pd.Series(index=df_opt.index, dtype=float)
+    for idx in df_opt.index:
+        if idx[1] == objetivo_principal:
+            pesos_filas[idx] = peso_principal / n_ppal
+        else:
+            pesos_filas[idx] = peso_otros / n_otros if n_otros > 0 else 0.0
+
+    # Pesos combinados por activo
+    pesos_combinados = {}
+    for activo in cols_activos:
+        if activo in df_opt.columns:
+            pesos_combinados[activo] = (df_opt[activo] * pesos_filas).sum()
+
+    suma = sum(pesos_combinados.values())
+    if suma > 0:
+        pesos_combinados = {k: v / suma for k, v in pesos_combinados.items()}
+
+    retorno     = (df_opt['Retorno']     * pesos_filas).sum()
+    volatilidad = (df_opt['Volatilidad'] * pesos_filas).sum()
+    sharpe      = (df_opt['Sharpe']      * pesos_filas).sum()
+
+    return {
+        'pesos':               pesos_combinados,
+        'retorno':             retorno,
+        'volatilidad':         volatilidad,
+        'sharpe':              sharpe,
+        'objetivo_principal':  objetivo_principal,
+        'peso_principal':      peso_principal,
+        'n_portafolios_usados': len(df_opt),
     }
