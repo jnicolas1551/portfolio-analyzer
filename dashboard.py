@@ -349,9 +349,17 @@ rf = rf_pct / 100
 st.sidebar.subheader("Criterio portafolio combinado")
 criterio_combinado = st.sidebar.radio(
     "Ponderar por:",
-    options=["Sharpe Ratio", "Information Ratio"],
-    horizontal=True,
-    help="Métrica usada para combinar los 9 portafolios óptimos."
+    options=[
+        "Sharpe Ratio",
+        "Information Ratio",
+        "Max Retorno (60% peso)",
+        "Min Volatilidad (60% peso)",
+    ],
+    help=(
+        "Sharpe / IR: pondera los 9 portafolios por la métrica elegida.\n"
+        "Max Retorno: asigna 60% a los 3 portafolios de máximo retorno, 40% al resto.\n"
+        "Min Volatilidad: asigna 60% a los 3 portafolios de mínima volatilidad, 40% al resto."
+    )
 )
 
 ejecutar = st.sidebar.button("▶ Ejecutar análisis", type="primary", use_container_width=True)
@@ -439,12 +447,16 @@ if ejecutar:
 
     with st.spinner("Optimizando portafolios..."):
         df_opt = optimizar_todos(tablas_act, df_cov_a, rf)
+        port_cons_ret = portafolio_consenso(df_opt, cols_activos, 'Max Retorno', 0.60)
+        port_cons_vol = portafolio_consenso(df_opt, cols_activos, 'Min Volatilidad', 0.60)
         if criterio_combinado == "Sharpe Ratio":
             port_combinado = portafolio_combinado_sharpe(df_opt, cols_activos)
-        else:
+        elif criterio_combinado == "Information Ratio":
             port_combinado = portafolio_combinado_ir(df_opt, df_ir, cols_activos)
-        port_cons_ret = portafolio_consenso(df_opt, cols_activos, 'Max Retorno',      0.60)
-        port_cons_vol = portafolio_consenso(df_opt, cols_activos, 'Min Volatilidad',  0.60)
+        elif criterio_combinado == "Max Retorno (60% peso)":
+            port_combinado = port_cons_ret
+        else:  # Min Volatilidad (60% peso)
+            port_combinado = port_cons_vol
 
     # -------------------------------------------------------------------------
     # SECCIÓN 1: RESUMEN
@@ -789,28 +801,27 @@ if ejecutar:
     with col_exp2:
         st.markdown("**📄 PDF — Investing Memo**")
         st.caption("Portafolios, consenso, metricas Sharpe e IR, asignacion de activos.")
-        if st.button("⚙️ Generar PDF", use_container_width=True, key="gen_pdf_pa"):
-            with st.spinner("Generando PDF..."):
-                try:
-                    pdf_bytes = generar_pdf_portafolio(
-                        cols_activos, benchmark, rf,
-                        df_opt, port_combinado, criterio_combinado,
-                        port_cons_ret, port_cons_vol,
-                        df_ir, df_sharpe, df_ea, df_vol_a
-                    )
-                    if pdf_bytes:
-                        st.download_button(
-                            label="📥 Descargar Investing Memo PDF",
-                            data=pdf_bytes,
-                            file_name=f"portfolio_memo_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                            mime="application/pdf",
-                            use_container_width=True,
-                            key="dl_pdf_pa"
-                        )
-                    else:
-                        st.error("fpdf2 no esta instalado. Agrega fpdf2 a requirements.txt.")
-                except Exception as e:
-                    st.error(f"Error generando PDF: {e}")
+        try:
+            _pdf_bytes = generar_pdf_portafolio(
+                cols_activos, benchmark, rf,
+                df_opt, port_combinado, criterio_combinado,
+                port_cons_ret, port_cons_vol,
+                df_ir, df_sharpe, df_ea, df_vol_a
+            )
+        except Exception as _e:
+            _pdf_bytes = b""
+            st.error(f"Error generando PDF: {_e}")
+        if _pdf_bytes:
+            st.download_button(
+                label="📥 Descargar Investing Memo PDF",
+                data=_pdf_bytes,
+                file_name=f"portfolio_memo_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="dl_pdf_pa"
+            )
+        else:
+            st.warning("fpdf2 no instalado. Ejecuta: pip install fpdf2")
 
 else:
     st.info("👈 Configura los parámetros en el panel izquierdo y presiona **Ejecutar análisis**.")
