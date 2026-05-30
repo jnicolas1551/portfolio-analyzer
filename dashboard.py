@@ -66,14 +66,26 @@ def _safe_str(text) -> str:
 def generar_pdf_portafolio(
     cols_activos, benchmark, rf,
     df_opt, port_combinado, criterio_combinado,
-    port_cons_ret, port_cons_vol,
-    df_ir, df_sharpe, df_ea, df_vol_a
+    df_ir, df_sharpe, df_ea, df_vol_a,
+    tablas_act, df_cov_a, df_corr, df_rango
 ) -> bytes:
     """Genera investing memo PDF del analisis de portafolio con fpdf2."""
     try:
         from fpdf import FPDF
     except ImportError:
         return b""
+
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import io as _io
+
+    def _fig_png(fig, dpi=130):
+        buf = _io.BytesIO()
+        fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight', facecolor='white')
+        buf.seek(0)
+        plt.close(fig)
+        return buf
 
     C_DARK  = (30, 58, 95)
     C_ALT   = (240, 244, 250)
@@ -145,7 +157,7 @@ def generar_pdf_portafolio(
     kv(pdf, 'Activos analizados', str(len(cols_activos)), alt=True)
     kv(pdf, 'Benchmark',          benchmark)
     kv(pdf, 'Tasa libre de riesgo', f'{rf:.2%}', alt=True)
-    kv(pdf, 'Metodo combinacion',  criterio_combinado)
+    kv(pdf, 'Criterio seleccionado', criterio_combinado)
     kv(pdf, 'Portafolio combinado - Retorno',    f'{port_combinado["retorno"]:.2%}', alt=True)
     kv(pdf, 'Portafolio combinado - Volatilidad',f'{port_combinado["volatilidad"]:.2%}')
     kv(pdf, 'Portafolio combinado - Sharpe',     f'{port_combinado["sharpe"]:.3f}', alt=True)
@@ -155,7 +167,6 @@ def generar_pdf_portafolio(
     section(pdf, '2. LOS 9 PORTAFOLIOS OPTIMOS (3 Metodos x 3 Objetivos)')
 
     if not df_opt.empty:
-        # Cabecera
         pdf.set_fill_color(*C_DARK)
         pdf.set_font('Helvetica', 'B', 7)
         pdf.set_text_color(255, 255, 255)
@@ -194,40 +205,95 @@ def generar_pdf_portafolio(
     for i, (activo, peso) in enumerate(sorted(port_combinado['pesos'].items(), key=lambda x: -x[1])):
         kv(pdf, activo, f'{peso:.2%}', alt=(i % 2 == 0))
 
-    # ── Portafolios Consenso ───────────────────────────────────────────────────
+    # ── Visualizaciones ────────────────────────────────────────────────────────
     pdf.add_page()
-    section(pdf, '4. PORTAFOLIOS CONSENSO PONDERADOS')
+    section(pdf, '4. VISUALIZACIONES')
 
-    for label, pc in [
-        ('Consenso 60% Max Retorno',       port_cons_ret),
-        ('Consenso 60% Min Volatilidad',   port_cons_vol),
-    ]:
-        pdf.ln(2)
+    # -- Frontera eficiente --
+    try:
+        from optimizacion import frontera_eficiente as _fe
+        _col_map = {'markowitz': '#1f77b4', 'capm': '#2ca02c', 'montecarlo': '#d62728'}
+        fig_fe, ax_fe = plt.subplots(figsize=(8, 4))
+        for _m in ['markowitz', 'capm', 'montecarlo']:
+            if _m not in tablas_act:
+                continue
+            _ret_m = tablas_act[_m].loc['Retorno']
+            _cov_m = df_cov_a.loc[cols_activos, cols_activos]
+            _df_fr = _fe(_ret_m, _cov_m, rf)
+            if not _df_fr.empty:
+                ax_fe.plot(_df_fr['Volatilidad'], _df_fr['Retorno'],
+                           color=_col_map[_m], lw=2, label=_m.capitalize())
+        if not df_opt.empty:
+            ax_fe.scatter(df_opt['Volatilidad'], df_opt['Retorno'],
+                          c='black', marker='*', s=120, zorder=5, label='Optimos')
+        ax_fe.scatter([port_combinado['volatilidad']], [port_combinado['retorno']],
+                      c='gold', marker='D', s=160, edgecolors='black', lw=1.5,
+                      zorder=6, label=f'Combinado ({criterio_combinado})')
+        ax_fe.set_xlabel('Volatilidad Anual', fontsize=9)
+        ax_fe.set_ylabel('Retorno Esperado', fontsize=9)
+        ax_fe.set_title('Frontera Eficiente — 3 Metodos', fontsize=10)
+        ax_fe.legend(fontsize=7)
+        ax_fe.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.1%}'))
+        ax_fe.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.1%}'))
+        ax_fe.grid(True, alpha=0.3)
+        fig_fe.tight_layout()
         pdf.set_font('Helvetica', 'B', 9)
-        pdf.cell(0, 7, f'  {label}', ln=True)
-        kv(pdf, 'Objetivo principal',  f'{pc["objetivo_principal"]} ({pc["peso_principal"]:.0%})', alt=True)
-        kv(pdf, 'Retorno esperado',    f'{pc["retorno"]:.2%}')
-        kv(pdf, 'Volatilidad',         f'{pc["volatilidad"]:.2%}', alt=True)
-        kv(pdf, 'Sharpe Ratio',        f'{pc["sharpe"]:.3f}')
-        kv(pdf, 'IR Ponderado',        f'{_ir_portafolio(pc["pesos"], df_ir):.3f}', alt=True)
-        pdf.ln(2)
-        pdf.set_font('Helvetica', 'B', 7.5)
-        pdf.set_fill_color(*C_DARK)
-        pdf.set_text_color(255, 255, 255)
-        for h, w in zip(['Activo', 'Peso'], [40, 30]):
-            pdf.cell(w, 6.5, h, border=1, fill=True, align='C')
+        pdf.cell(0, 6, '  Frontera Eficiente', ln=True)
+        pdf.image(_fig_png(fig_fe), x=15, w=175)
+        pdf.ln(3)
+    except Exception:
+        pass
+
+    # -- Matriz de correlacion --
+    try:
+        _n = len(df_corr)
+        _fsz = max(5, _n * 0.9)
+        fig_cr, ax_cr = plt.subplots(figsize=(_fsz, _fsz * 0.75))
+        _im = ax_cr.imshow(df_corr.values, cmap='RdBu_r', vmin=-1, vmax=1)
+        ax_cr.set_xticks(range(_n))
+        ax_cr.set_yticks(range(_n))
+        ax_cr.set_xticklabels(df_corr.columns, rotation=45, ha='right', fontsize=8)
+        ax_cr.set_yticklabels(df_corr.index, fontsize=8)
+        for _i in range(_n):
+            for _j in range(_n):
+                _v = df_corr.iloc[_i, _j]
+                ax_cr.text(_j, _i, f'{_v:.2f}', ha='center', va='center',
+                           fontsize=7, color='white' if abs(_v) > 0.6 else 'black')
+        plt.colorbar(_im, ax=ax_cr, shrink=0.8)
+        ax_cr.set_title('Matriz de Correlacion de Rendimientos', fontsize=10)
+        fig_cr.tight_layout()
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.cell(0, 6, '  Matriz de Correlacion', ln=True)
+        pdf.image(_fig_png(fig_cr), x=15, w=175)
+        pdf.ln(3)
+    except Exception:
+        pass
+
+    # ── Rango Percentil Actual ─────────────────────────────────────────────────
+    pdf.add_page()
+    section(pdf, '5. RANGO PERCENTIL ACTUAL')
+    pdf.set_font('Helvetica', '', 8)
+    pdf.multi_cell(0, 5, _safe_str(
+        "Posicion relativa del rendimiento actual de cada activo dentro de su distribucion historica."
+    ))
+    pdf.ln(2)
+    pdf.set_fill_color(*C_DARK)
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(60, 7, 'Activo',          border=1, fill=True, align='C')
+    pdf.cell(50, 7, 'Rango Percentil', border=1, fill=True, align='C')
+    pdf.ln()
+    pdf.set_text_color(0, 0, 0)
+    for _i, (_act, _val) in enumerate(df_rango.items()):
+        pdf.set_fill_color(*(C_ALT if _i % 2 == 0 else (255, 255, 255)))
+        pdf.set_font('Helvetica', '', 8)
+        _pct = f'{_val:.2%}' if pd.notna(_val) else 'N/A'
+        pdf.cell(60, 6.5, _act,  border=1, fill=True)
+        pdf.cell(50, 6.5, _pct,  border=1, fill=True, align='C')
         pdf.ln()
-        pdf.set_text_color(0, 0, 0)
-        for j, (activo, peso) in enumerate(sorted(pc['pesos'].items(), key=lambda x: -x[1])):
-            pdf.set_fill_color(*(C_ALT if j % 2 == 0 else (255, 255, 255)))
-            pdf.set_font('Helvetica', '', 7.5)
-            pdf.cell(40, 6, activo, border=1, fill=True)
-            pdf.cell(30, 6, f'{peso:.2%}', border=1, fill=True, align='C')
-            pdf.ln()
-        pdf.ln(4)
 
     # ── Metricas por activo ───────────────────────────────────────────────────
-    section(pdf, '5. METRICAS POR ACTIVO (ultimo periodo disponible)')
+    section(pdf, '6. METRICAS POR ACTIVO (ultimo periodo disponible)')
     pdf.set_fill_color(*C_DARK)
     pdf.set_font('Helvetica', 'B', 7)
     pdf.set_text_color(255, 255, 255)
@@ -268,7 +334,7 @@ def generar_pdf_portafolio(
         "sobre distribucion de retornos que pueden no verificarse en el futuro.\n\n"
         "Metodologia: WACC via CAPM, optimizacion via scipy SLSQP, "
         "Information Ratio = (Retorno portafolio - Retorno benchmark) / Tracking Error. "
-        "Portafolios consenso: ponderacion por objetivo segun fraccion definida por el usuario."
+        "Portafolio combinado: ponderacion segun criterio seleccionado por el usuario."
     )
     pdf.multi_cell(0, 5, disclaimer)
 
@@ -506,16 +572,14 @@ if ejecutar:
     # -------------------------------------------------------------------------
     # SECCIÓN 4: ANÁLISIS UNIFICADO DE PORTAFOLIOS
     # -------------------------------------------------------------------------
-    st.header("🏆 Análisis Unificado de Portafolios")
-    st.caption("Comparación de los 9 portafolios optimizados + 2 portafolios consenso ponderados.")
+    st.header("🏆 Análisis Unificado — 9 Portafolios Óptimos")
+    st.caption("Comparación de los 9 portafolios optimizados: 3 métodos × 3 objetivos.")
 
-    # Tabla comparativa: 9 + 2 portafolios
     if not df_opt.empty:
         filas_unif = []
         for idx, row in df_opt.iterrows():
             pesos_row = {a: row[a] for a in cols_activos if a in row.index}
             filas_unif.append({
-                'Tipo':        'Optimizado',
                 'Metodo':      idx[0],
                 'Objetivo':    idx[1],
                 'Retorno':     row['Retorno'],
@@ -523,78 +587,13 @@ if ejecutar:
                 'Sharpe':      row['Sharpe'],
                 'IR Pond.':    _ir_portafolio(pesos_row, df_ir),
             })
-
-        for label, pc in [
-            ('Consenso 60% Max Retorno',     port_cons_ret),
-            ('Consenso 60% Min Volatilidad', port_cons_vol),
-        ]:
-            filas_unif.append({
-                'Tipo':        'Consenso',
-                'Metodo':      label,
-                'Objetivo':    f'{pc["objetivo_principal"]} ({pc["peso_principal"]:.0%})',
-                'Retorno':     pc['retorno'],
-                'Volatilidad': pc['volatilidad'],
-                'Sharpe':      pc['sharpe'],
-                'IR Pond.':    _ir_portafolio(pc['pesos'], df_ir),
-            })
-
         df_unif = pd.DataFrame(filas_unif)
         df_unif_display = df_unif.copy()
         for col in ['Retorno', 'Volatilidad']:
             df_unif_display[col] = df_unif_display[col].map(lambda x: f"{x:.2%}")
-        df_unif_display['Sharpe']    = df_unif_display['Sharpe'].map(lambda x: f"{x:.3f}")
-        df_unif_display['IR Pond.']  = df_unif_display['IR Pond.'].map(lambda x: f"{x:.3f}")
+        df_unif_display['Sharpe']   = df_unif_display['Sharpe'].map(lambda x: f"{x:.3f}")
+        df_unif_display['IR Pond.'] = df_unif_display['IR Pond.'].map(lambda x: f"{x:.3f}")
         st.dataframe(df_unif_display, use_container_width=True, hide_index=True)
-
-        # Scatter retorno vs volatilidad — todos los portafolios
-        fig_unif = go.Figure()
-        colores_tipo = {'Optimizado': '#4C8BF5', 'Consenso': '#FFD600'}
-        simbolos     = {'Optimizado': 'circle',  'Consenso': 'star'}
-        for tipo in ['Optimizado', 'Consenso']:
-            sub = df_unif[df_unif['Tipo'] == tipo]
-            fig_unif.add_trace(go.Scatter(
-                x=sub['Volatilidad'],
-                y=sub['Retorno'],
-                mode='markers+text',
-                name=tipo,
-                text=sub['Objetivo'],
-                textposition='top center',
-                textfont=dict(size=8),
-                marker=dict(size=12 if tipo == 'Consenso' else 9,
-                            color=colores_tipo[tipo],
-                            symbol=simbolos[tipo],
-                            line=dict(color='white', width=1))
-            ))
-        fig_unif.update_layout(
-            title='Retorno vs Volatilidad — 9 Portafolios + 2 Consenso',
-            xaxis_title='Volatilidad Anual',
-            yaxis_title='Retorno Esperado',
-            xaxis=dict(tickformat='.1%'),
-            yaxis=dict(tickformat='.1%'),
-            height=420,
-            template='plotly_dark',
-        )
-        st.plotly_chart(fig_unif, use_container_width=True)
-
-    # Portafolios consenso — detalle
-    st.subheader("Portafolios Consenso Ponderados")
-    col_c1, col_c2 = st.columns(2)
-    for col_c, pc, label in [
-        (col_c1, port_cons_ret, "60% Max Retorno"),
-        (col_c2, port_cons_vol, "60% Min Volatilidad"),
-    ]:
-        with col_c:
-            st.markdown(f"**{label}**")
-            st.metric("Retorno",     f'{pc["retorno"]:.2%}')
-            st.metric("Volatilidad", f'{pc["volatilidad"]:.2%}')
-            st.metric("Sharpe",      f'{pc["sharpe"]:.3f}')
-            st.metric("IR Pond.",    f'{_ir_portafolio(pc["pesos"], df_ir):.3f}')
-            df_cons = pd.DataFrame(
-                sorted(pc['pesos'].items(), key=lambda x: -x[1]),
-                columns=['Activo', 'Peso']
-            )
-            df_cons['Peso'] = df_cons['Peso'].map(lambda x: f"{x:.1%}")
-            st.dataframe(df_cons, use_container_width=True, hide_index=True)
 
     # -------------------------------------------------------------------------
     # SECCIÓN 5: ANÁLISIS DETALLADO
@@ -805,8 +804,8 @@ if ejecutar:
             _pdf_bytes = generar_pdf_portafolio(
                 cols_activos, benchmark, rf,
                 df_opt, port_combinado, criterio_combinado,
-                port_cons_ret, port_cons_vol,
-                df_ir, df_sharpe, df_ea, df_vol_a
+                df_ir, df_sharpe, df_ea, df_vol_a,
+                tablas_act, df_cov_a, df_corr, df_rango
             )
         except Exception as _e:
             _pdf_bytes = b""
