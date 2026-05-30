@@ -4,6 +4,8 @@ Dashboard interactivo de analisis estadistico y optimizacion de portafolios de i
 Soporta activos del S&P 500, BVC Colombia y FICs colombianos.
 
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://portfolio-analyzer-jnrc.streamlit.app)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
